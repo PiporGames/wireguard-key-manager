@@ -161,6 +161,7 @@ class WireGuardKeyManager:
         # Validar tipo de red
         network_type = validate_network_type(network_type)
         
+        # Obtener IPs ya usadas
         used_ips = set()
         for key_entry in self.keys_db["keys"]:
             ip = key_entry["ip"].split("/")[0]  # Remover /24
@@ -170,12 +171,10 @@ class WireGuardKeyManager:
         if network_type == 0:
             # Red privada: 10.1.1.2 - 10.1.1.254
             network_prefix = "10.1.1"
-            network_name = "red privada 10.1.1.0/24"
             start_ip = 2
         else:
             # Usuarios: 10.1.2.1 - 10.1.2.254
             network_prefix = "10.1.2"
-            network_name = "usuarios 10.1.2.0/24"
             start_ip = 1
         
         # Buscar IP disponible en el rango
@@ -184,11 +183,19 @@ class WireGuardKeyManager:
             if ip not in used_ips:
                 return ip
         
-        raise Exception(f"No hay IPs disponibles en la red {network_name}")
+        raise Exception(f"No hay IPs disponibles en la red")
     
     def _add_peer_to_wireguard(self, public_key: str, ip: str):
         """Añade el peer a la configuración de WireGuard."""
         try:
+            # Apagar interfaz wg0
+            subprocess.run(
+                ["wg-quick", "down", "wg0"],
+                check=True,  # No fallar si no está arriba
+                capture_output=True,
+                text=True
+            )
+            
             # Añadir peer usando wg set
             subprocess.run(
                 ["wg", "set", "wg0", "peer", public_key, "allowed-ips", f"{ip}/32"],
@@ -200,9 +207,19 @@ class WireGuardKeyManager:
             # Guardar configuración
             subprocess.run(
                 ["wg-quick", "save", "wg0"],
-                check=False,  # No fallar si no existe el comando
-                capture_output=True
+                check=True,  # No fallar si no existe el comando
+                capture_output=True,
+                text=True
             )
+            
+            # Encender interfaz wg0
+            subprocess.run(
+                ["wg-quick", "up", "wg0"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr.strip() if e.stderr else str(e)
             raise Exception(f"No se pudo registrar en WireGuard: {error_msg}")
@@ -212,6 +229,14 @@ class WireGuardKeyManager:
     def _remove_peer_from_wireguard(self, public_key: str):
         """Elimina el peer de la configuración de WireGuard."""
         try:
+            # Apagar interfaz wg0
+            subprocess.run(
+                ["wg-quick", "down", "wg0"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            
             # Eliminar peer
             subprocess.run(
                 ["wg", "set", "wg0", "peer", public_key, "remove"],
@@ -223,9 +248,18 @@ class WireGuardKeyManager:
             # Guardar configuración
             subprocess.run(
                 ["wg-quick", "save", "wg0"],
-                check=False,
+                check=True,
                 capture_output=True
             )
+            
+            # Encender interfaz wg0
+            subprocess.run(
+                ["wg-quick", "up", "wg0"],
+                check=True,
+                capture_output=True,
+                text=True
+            )
+            
         except subprocess.CalledProcessError as e:
             error_msg = e.stderr.strip() if e.stderr else str(e)
             raise Exception(f"No se pudo eliminar de WireGuard: {error_msg}")
