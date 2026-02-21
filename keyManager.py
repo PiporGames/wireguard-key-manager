@@ -9,6 +9,7 @@ import subprocess
 import re
 from pathlib import Path
 from typing import Optional, List, Dict
+import concurrent.futures
 
 # Configuración de la aplicación
 KEYS_DB_FILE = "keys_database.json"
@@ -17,6 +18,7 @@ SERVER_PUBLIC_KEY_FILE = "publickey"
 ENDPOINT = "example.com:51820"
 PRIVATE_NETWORK = "10.1.1.0/24, 10.1.2.0/24"
 DNS_SERVER = "10.1.1.1"
+PING_TIMEOUT = 0.5  # Timeout de ping en segundos (500ms)
 
 # Constantes de validación
 MAX_NAME_LENGTH = 64
@@ -188,15 +190,14 @@ class WireGuardKeyManager:
     def _add_peer_to_wireguard(self, public_key: str, ip: str):
         """Añade el peer a la configuración de WireGuard."""
         try:
-            # Apagar interfaz wg0
+            # Asegurar que la interfaz esté arriba
             subprocess.run(
-                ["wg-quick", "down", "wg0"],
-                check=True,  # No fallar si no está arriba
-                capture_output=True,
-                text=True
+                ["wg-quick", "up", "wg0"],
+                check=False,
+                capture_output=True
             )
             
-            # Añadir peer usando wg set
+            # Añadir peer usando wg set (interfaz debe estar UP)
             subprocess.run(
                 ["wg", "set", "wg0", "peer", public_key, "allowed-ips", f"{ip}/32"],
                 check=True,
@@ -204,17 +205,17 @@ class WireGuardKeyManager:
                 text=True
             )
             
-            # Guardar configuración
+            # Guardar configuración actual al archivo .conf para persistencia
             subprocess.run(
                 ["wg-quick", "save", "wg0"],
-                check=True,  # No fallar si no existe el comando
+                check=True,
                 capture_output=True,
                 text=True
             )
             
-            # Encender interfaz wg0
+            # Reiniciar servicio de Wireguard
             subprocess.run(
-                ["wg-quick", "up", "wg0"],
+                ["systemctl", "restart", "wg-quick@wg0"],
                 check=True,
                 capture_output=True,
                 text=True
@@ -229,15 +230,13 @@ class WireGuardKeyManager:
     def _remove_peer_from_wireguard(self, public_key: str):
         """Elimina el peer de la configuración de WireGuard."""
         try:
-            # Apagar interfaz wg0
+            # Asegurar que la interfaz esté arriba
             subprocess.run(
-                ["wg-quick", "down", "wg0"],
-                check=True,
-                capture_output=True,
-                text=True
-            )
+                ["wg-quick", "up", "wg0"],
+                check=False,
+                capture_output=True)
             
-            # Eliminar peer
+            # Eliminar peer (interfaz debe estar UP)
             subprocess.run(
                 ["wg", "set", "wg0", "peer", public_key, "remove"],
                 check=True,
@@ -245,16 +244,17 @@ class WireGuardKeyManager:
                 text=True
             )
             
-            # Guardar configuración
+            # Guardar configuración persistente
             subprocess.run(
                 ["wg-quick", "save", "wg0"],
                 check=True,
-                capture_output=True
+                capture_output=True,
+                text=True
             )
             
-            # Encender interfaz wg0
+            # Reiniciar servicio de Wireguard
             subprocess.run(
-                ["wg-quick", "up", "wg0"],
+                ["systemctl", "restart", "wg-quick@wg0"],
                 check=True,
                 capture_output=True,
                 text=True
@@ -430,6 +430,79 @@ Endpoint = {ENDPOINT}
         
         raise Exception(f"No se encontró la llave '{name}'")
 
+    def _ping_ip(self, ip: str) -> float:
+        """Realiza un ping a una IP con timeout de 500ms y devuelve la latencia."""
+        try:
+            # -c 1: enviar 1 paquete
+            # -W 0.5: esperar 500ms
+            cmd = ["ping", "-c", "1", "-W", f"{PING_TIMEOUT}", ip]
+            
+            output = subprocess.check_output(
+                cmd,
+                universal_newlines=True,
+                stderr=subprocess.DEVNULL
+            )
+            
+            # Buscar tiempo en la salida (time=XX.X ms)
+            match = re.search(r"time=([\d.]+)", output)
+            if match:
+                return float(match.group(1))
+            return -1.0
+        except Exception:
+            # Si hay error (timeout, error de comando, etc), asumimos fallo
+            return -1.0
+
+    def _ping_entry(self, ip_wg: str, local_ip: str = None) -> List:
+        """Realiza pings a las IPs de una entrada."""
+        latency_wg = self._ping_ip(ip_wg)
+        result = [ip_wg, latency_wg]
+        
+        if local_ip:
+            latency_local = self._ping_ip(local_ip)
+            result.append(latency_local)
+            
+        return result
+
+    def _ping_network(self, network_type: int) -> List[List]:
+        """Realiza pings a todas las IPs de un tipo de red en paralelo."""
+        # Obtener entradas del tipo de red
+        target_entries = []
+        for key in self.keys_db["keys"]:
+            current_net_type = key.get('network_type', 1)
+            if current_net_type == network_type:
+                # Extraer IP sin máscara
+                ip_wg = key['ip'].split('/')[0]
+                local_ip = key.get('localip')  # Obtener localip si existe
+                target_entries.append((ip_wg, local_ip))
+        
+        results = []
+        if not target_entries:
+            return results
+            
+        # Ejecutar pings en paralelo
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(50, len(target_entries))) as executor:
+            future_to_entry = {executor.submit(self._ping_entry, ip_wg, local_ip): ip_wg for ip_wg, local_ip in target_entries}
+            for future in concurrent.futures.as_completed(future_to_entry):
+                try:
+                    res = future.result()
+                    results.append(res)
+                except Exception:
+                    # En caso de error inesperado en _ping_entry
+                    ip_wg = future_to_entry[future]
+                    results.append([ip_wg, -1.0])
+
+        # Ordenar resultados por IP para consistencia
+        results.sort(key=lambda x: [int(part) for part in x[0].split('.')])
+        return results
+
+    def ping_all_private_network(self) -> List[List]:
+        """Realiza ping a toda la red privada (tipo 0)."""
+        return self._ping_network(0)
+
+    def ping_all_users_network(self) -> List[List]:
+        """Realiza ping a toda la red de usuarios (tipo 1)."""
+        return self._ping_network(1)
+
     def list_keys(self) -> List[Dict]:
         """Lista todas las llaves registradas"""
         return self.keys_db["keys"]
@@ -449,7 +522,9 @@ def interactive_menu():
         print("5. Exportar llave (base64 modificado)")
         print("6. Eliminar llave")
         print("7. Mover llave a otra IP")
-        print("8. Salir")
+        print("9. Ping a toda la red privada")
+        print("10. Ping a toda la red de usuarios")
+        print("11. Salir")
         
         choice = input("\nSeleccione una opción: ").strip()
         
@@ -549,8 +624,52 @@ def interactive_menu():
                 except (ValueError, Exception) as e:
                     print(f"Error: {e}")
                     continue
+
+            elif choice == "9":
+                print("\nHaciendo ping a toda la red privada (max 500ms)...")
+                try:
+                    results = manager.ping_all_private_network()
+                    if not results:
+                        print("No hay dispositivos en la red privada.")
+                    else:
+                        print(f"\n--- Resultados Red Privada ({len(results)} IPs) ---")
+                        for item in results:
+                            ip = item[0]
+                            latency_wg = item[1]
+                            status_wg = f"{latency_wg} ms" if latency_wg >= 0 else "TIMEOUT"
+                            
+                            if len(item) > 2:
+                                latency_local = item[2]
+                                status_local = f"{latency_local} ms" if latency_local >= 0 else "TIMEOUT"
+                                print(f"  {ip:<15} : WG={status_wg:<10} LOCAL={status_local}")
+                            else:
+                                print(f"  {ip:<15} : {status_wg}")
+                except Exception as e:
+                    print(f"Error ejecutando pings: {e}")
+
+            elif choice == "10":
+                print("\nHaciendo ping a toda la red de usuarios (max 500ms)...")
+                try:
+                    results = manager.ping_all_users_network()
+                    if not results:
+                        print("No hay usuarios registrados.")
+                    else:
+                        print(f"\n--- Resultados Red Usuarios ({len(results)} IPs) ---")
+                        for item in results:
+                            ip = item[0]
+                            latency_wg = item[1]
+                            status_wg = f"{latency_wg} ms" if latency_wg >= 0 else "TIMEOUT"
+                            
+                            if len(item) > 2:
+                                latency_local = item[2]
+                                status_local = f"{latency_local} ms" if latency_local >= 0 else "TIMEOUT"
+                                print(f"  {ip:<15} : WG={status_wg:<10} LOCAL={status_local}")
+                            else:
+                                print(f"  {ip:<15} : {status_wg}")
+                except Exception as e:
+                    print(f"Error ejecutando pings: {e}")
             
-            elif choice == "8":
+            elif choice == "11":
                 print("\nSaliendo...")
                 break
             
@@ -578,11 +697,23 @@ def run_server():
                 
                 elif self.path.startswith('/export/file?name='):          
                     name = self.path.split('=')[1]
-                    self._reply(200, WireGuardKeyManager().export_key_file(name), 'text/plain')
+                    mgr = WireGuardKeyManager()
+                    config_content = mgr.export_key_text(name)
+                    config_filename = safe_filename(name)
+                    self._reply(200, config_content, 'application/octet-stream', filename=config_filename)
+                    # Eliminar el archivo temporal después de enviarlo
+                    if os.path.exists(config_filename):
+                        os.remove(config_filename)
                     
                 elif self.path.startswith('/export/modbase64?name='):
                     name = self.path.split('=')[1]
                     self._reply(200, WireGuardKeyManager().export_key_mod_base64(name), 'text/plain')
+                
+                elif self.path == '/ping/private':
+                    self._reply(200, json.dumps(WireGuardKeyManager().ping_all_private_network()))
+                
+                elif self.path == '/ping/users':
+                    self._reply(200, json.dumps(WireGuardKeyManager().ping_all_users_network()))
                 
                 else: self.send_error(404)
             except Exception as e: self._reply(500, json.dumps({'error': str(e)}))
@@ -607,9 +738,11 @@ def run_server():
                 else: self.send_error(404)
             except Exception as e: self._reply(500, json.dumps({'error': str(e)}))
 
-        def _reply(self, code, body, content_type='application/json'):
+        def _reply(self, code, body, content_type='application/json', filename=None):
             self.send_response(code)
             self.send_header('Content-type', content_type)
+            if filename:
+                self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
             self.end_headers()
             self.wfile.write(body.encode())
             

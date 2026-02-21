@@ -16,6 +16,8 @@ Ofrece una interfaz de línea de comandos (CLI) interactiva y un servidor API HT
     - Texto plano
     - Base64 modificado, compatible con el comando `wireguard://install/` de la [versión modificada de Wireguard para URIs y NetPriv](https://github.com/PiporGames/wireguard-windows)
 *   **Validación:** Verificación estricta de nombres y rangos IP para evitar conflictos.
+*   **Integración con WireGuard:** Utiliza comandos `wg` para aplicar cambios en tiempo real.
+*   **Comprobación por Ping:** Permite verificar la conectividad de cada cliente mediante ping.
 *   **Modo Servicio:** A parte de tener un menú interactivo, también permite solicitudes API HTTP ligera para gestión remota.
 
 ## Requisitos
@@ -33,6 +35,12 @@ Especifica donde se encuentra la base de datos de llaves
 Especifica el punto de entrada por donde acceder al servicio de Wireguard desde fuera
 *   **DNS:** `10.1.1.1`  
 Especifica el servidor DNS a usar por los clientes de la red
+*   **Timeout de Ping:** `0.5` segundos
+Especifica el tiempo máximo a esperar por una respuesta de ping antes de considerar que el cliente no responde
+
+Nota: Es también posible añadir una IP local a cada cliente en la base de datos de forma manual. Esta IP local es útil para identificar cada cliente en la red local y, si está definida, se usará para hacer ping en conjunto con la de la IP privada de WireGuard.
+Esta IP local no es obligatoria ni tampoco el programa está diseñado para gestionarla, solo se puede definir manualmente.
+Para definirla, en la base de datos de llaves (`keys_database.json`), añada el campo `localip` a cada cliente con la IP local deseada (ejemplo: `"localip": "192.168.1.2"})
 
 ## Uso
 
@@ -72,6 +80,9 @@ Una vez activo el servicio, puede interactuar mediante HTTP:
 *   **POST** `/create`: Crear llave (JSON body: `{"name": "usuario", "type": 1}`).
 *   **POST** `/delete`: Eliminar llave (JSON body: `{"name": "usuario"}`).
 *   **POST** `/move`: Cambiar IP (JSON body: `{"name": "usuario", "ip": "10.1.2.50"}`).
+*   **POST** `/ping`: Verificar conectividad (JSON body: `{"name": "usuario"}`).
+*   **GET** `/ping/private`: Verificar conectividad de toda la red privada.
+*   **GET** `/ping/users`: Verificar conectividad de toda la red de usuarios.
 
 ### (Opcional) Instalación como Servicio (API HTTP)
 
